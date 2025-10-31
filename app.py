@@ -10,6 +10,7 @@ from typing import List, Optional
 import uvicorn
 from datetime import datetime
 import os
+import time
 
 # ==========================
 # 2. Initialize FastAPI App
@@ -74,19 +75,30 @@ preprocessor = None
 model_loaded = False
 
 # ==========================
-# 5. Load Model on Startup
+# 5. Load Model on Startup with Retries
 # ==========================
 @app.on_event("startup")
 async def load_model():
     global model, preprocessor, model_loaded
-    try:
-        model = joblib.load("production_predictive_maintenance_model.pkl")
-        preprocessor = joblib.load("preprocessor.pkl")
-        model_loaded = True
-        print("✅ Model and preprocessor loaded successfully!")
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        model_loaded = False
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Loading model... Attempt {attempt + 1}/{max_retries}")
+            model = joblib.load("production_predictive_maintenance_model.pkl")
+            preprocessor = joblib.load("preprocessor.pkl")
+            model_loaded = True
+            print("✅ Model and preprocessor loaded successfully!")
+            break
+        except Exception as e:
+            print(f"❌ Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("💥 All attempts to load model failed!")
+                model_loaded = False
 
 # ==========================
 # 6. Helper Functions
@@ -403,21 +415,32 @@ async def get_api_stats():
     }
 
 # ==========================
-# 8. Render Configuration & Server Startup
+# 8. Railway & Production Configuration
 # ==========================
 def get_port():
-    """Get port from environment variable for Render compatibility"""
+    """Get port from environment variable for cloud compatibility"""
     return int(os.environ.get("PORT", 8000))
 
-if __name__ == "__main__":
+def start_server():
+    """Start the server with production settings"""
     port = get_port()
-    print(f"🚀 Starting Predictive Maintenance API on port {port}")
-    print(f"📚 Documentation available at: http://localhost:{port}/docs")
-    print(f"❤️  Health check at: http://localhost:{port}/health")
+    
+    print("🚀" * 50)
+    print("🤖 Predictive Maintenance API Starting...")
+    print(f"📊 Model Loaded: {model_loaded}")
+    print(f"🌐 Port: {port}")
+    print(f"📚 Docs: http://0.0.0.0:{port}/docs")
+    print(f"❤️  Health: http://0.0.0.0:{port}/health")
+    print("🚀" * 50)
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=port,
-        reload=False  # Disable auto-reload in production
+        reload=False,  # Disable in production
+        access_log=True,
+        log_level="info"
     )
+
+if __name__ == "__main__":
+    start_server()
