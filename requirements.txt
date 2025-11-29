@@ -5,3 +5,8 @@ pandas==2.2.3
 numpy==2.1.2
 joblib==1.4.2
 python-multipart==0.0.9
+
+tenserflow
+logging
+typing
+pydantic
