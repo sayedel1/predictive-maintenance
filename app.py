@@ -1,446 +1,486 @@
-# ==========================
-# 1. Import Libraries
-# ==========================
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_core import ValidationError
 import pandas as pd
 import numpy as np
+import tensorflow as tf
 import joblib
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uvicorn
-from datetime import datetime
-import os
-import time
+import logging
 
-# ==========================
-# 2. Initialize FastAPI App
-# ==========================
+# -------------------------------------
+# Setup Logging
+# -------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -------------------------------------
+# FastAPI Application
+# -------------------------------------
 app = FastAPI(
     title="Predictive Maintenance API",
-    description="Advanced API for predicting machine failures and maintenance needs using ML",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    description="API for predicting machine failures using TensorFlow Lite with data validation",
+    version="2.0.0"
 )
 
-# ==========================
-# 3. Define Data Models
-# ==========================
-class MachineData(BaseModel):
-    Type: str
-    Air_temperature_K: float
-    Process_temperature_K: float
-    Rotational_speed_rpm: float
-    Torque_Nm: float
-    Tool_wear_min: float
+# -------------------------------------
+# CORS Middleware
+# -------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class PredictionRequest(BaseModel):
-    machines: List[MachineData]
+# -------------------------------------
+# Global variables for loaded models
+# -------------------------------------
+preprocessor = None
+interpreter = None
+input_details = None
+output_details = None
+
+# -------------------------------------
+# Configuration - REALISTIC RANGES
+# -------------------------------------
+VALID_RANGES = {
+    "Air temperature [K]": (290.0, 310.0),      # ~17°C to 37°C (Realistic room temp)
+    "Process temperature [K]": (300.0, 320.0),  # ~27°C to 47°C (Realistic process temp)
+    "Rotational speed [rpm]": (1000.0, 3000.0), # Realistic RPM range
+    "Torque [Nm]": (10.0, 80.0),               # Realistic torque range
+    "Tool wear [min]": (0.0, 300.0)            # Realistic tool wear
+}
+
+# ABSOLUTE MAXIMUM RANGES (for critical errors)
+ABSOLUTE_LIMITS = {
+    "Air temperature [K]": (273.0, 500.0),     # 0°C to 227°C (Absolute min/max)
+    "Process temperature [K]": (273.0, 600.0), # 0°C to 327°C
+    "Rotational speed [rpm]": (0.0, 10000.0),
+    "Torque [Nm]": (0.0, 500.0),
+    "Tool wear [min]": (0.0, 1000.0)
+}
+
+# -------------------------------------
+# Pydantic V2 Models with Validation
+# -------------------------------------
+class MaintenanceFeatures(BaseModel):
+    Type: Optional[str] = Field(None, alias="Type")
+    Air_temperature_K: Optional[float] = Field(None, alias="Air temperature [K]")
+    Process_temperature_K: Optional[float] = Field(None, alias="Process temperature [K]")
+    Rotational_speed_rpm: Optional[float] = Field(None, alias="Rotational speed [rpm]")
+    Torque_Nm: Optional[float] = Field(None, alias="Torque [Nm]")
+    Tool_wear_min: Optional[float] = Field(None, alias="Tool wear [min]")
+
+    model_config = {
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "example": {
+                "Type": "M",
+                "Air temperature [K]": 298.5,
+                "Process temperature [K]": 308.8,
+                "Rotational speed [rpm]": 1450,
+                "Torque [Nm]": 42.3,
+                "Tool wear [min]": 45
+            }
+        }
+    }
+
+    @field_validator('Type')
+    @classmethod
+    def validate_type(cls, v):
+        if v is not None and v.upper() not in ['L', 'M', 'H']:
+            raise ValueError('Type must be L, M, or H')
+        return v.upper() if v else v
+
+    @field_validator('Air_temperature_K', 'Process_temperature_K', 'Rotational_speed_rpm', 'Torque_Nm', 'Tool_wear_min')
+    @classmethod
+    def validate_absolute_limits(cls, v, info):
+        if v is None:
+            return v
+            
+        field_name = info.field_name
+        field_map = {
+            'Air_temperature_K': 'Air temperature [K]',
+            'Process_temperature_K': 'Process temperature [K]', 
+            'Rotational_speed_rpm': 'Rotational speed [rpm]',
+            'Torque_Nm': 'Torque [Nm]',
+            'Tool_wear_min': 'Tool wear [min]'
+        }
+        
+        display_name = field_map.get(field_name, field_name)
+        
+        if display_name in ABSOLUTE_LIMITS:
+            min_val, max_val = ABSOLUTE_LIMITS[display_name]
+            if not (min_val <= v <= max_val):
+                raise ValueError(f'{display_name} ({v}) is outside possible physical range ({min_val}-{max_val})')
+        
+        return v
 
 class PredictionResponse(BaseModel):
-    machine_id: int
+    prediction: float
+    failure_probability: float
+    prediction_class: int
     status: str
-    prediction: str
-    confidence: float
-    alert_level: str
-    maintenance_needed: bool
-    recommendation: str
-    timestamp: str
+    warning: Optional[str] = None
+    data_quality: str = "good"  # good, warning, error
 
-class BatchPredictionResponse(BaseModel):
-    predictions: List[PredictionResponse]
-    total_machines: int
-    machines_need_maintenance: int
-    overall_risk_level: str
-    maintenance_percentage: float
-
-class HealthCheck(BaseModel):
+class HealthResponse(BaseModel):
     status: str
-    model_loaded: bool
-    timestamp: str
-    version: str
+    models_loaded: bool
+    message: str
 
-class APIInfo(BaseModel):
-    name: str
-    version: str
-    status: str
-    endpoints: list
-    documentation: str
+class ValidationResponse(BaseModel):
+    valid: bool
+    errors: List[str] = []
+    warnings: List[str] = []
+    data_quality: str = "good"
 
-# ==========================
-# 4. Global Variables
-# ==========================
-model = None
-preprocessor = None
-model_loaded = False
-
-# ==========================
-# 5. Load Model on Startup with Retries
-# ==========================
+# -------------------------------------
+# Load Models at Startup
+# -------------------------------------
 @app.on_event("startup")
-async def load_model():
-    global model, preprocessor, model_loaded
-    max_retries = 3
-    retry_delay = 2  # seconds
+async def load_models():
+    """Load the preprocessor and TensorFlow Lite model"""
+    global preprocessor, interpreter, input_details, output_details
+
+    try:
+        preprocessor = joblib.load('preprocessor.pkl')
+        logger.info("✅ Preprocessor loaded successfully")
+
+        interpreter = tf.lite.Interpreter(model_path='predictive_maintenance_model.tflite')
+        interpreter.allocate_tensors()
+
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+
+        logger.info("✅ TensorFlow Lite model loaded successfully")
+        logger.info(f"📋 Model Input: {input_details[0]['shape']}, {input_details[0]['dtype']}")
+        logger.info(f"📋 Model Output: {output_details[0]['shape']}, {output_details[0]['dtype']}")
+
+    except Exception as e:
+        logger.error(f"❌ Error loading models: {str(e)}")
+        raise e
+
+# -------------------------------------
+# Enhanced Helper Functions
+# -------------------------------------
+def validate_data_quality(features_dict: dict) -> Dict[str, Any]:
+    """
+    Validate data quality and return warnings/errors
+    """
+    warnings = []
+    data_quality = "good"
     
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 Loading model... Attempt {attempt + 1}/{max_retries}")
-            model = joblib.load("production_predictive_maintenance_model.pkl")
-            preprocessor = joblib.load("preprocessor.pkl")
-            model_loaded = True
-            print("✅ Model and preprocessor loaded successfully!")
-            break
-        except Exception as e:
-            print(f"❌ Attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                print("💥 All attempts to load model failed!")
-                model_loaded = False
-
-# ==========================
-# 6. Helper Functions
-# ==========================
-def create_features(input_data: pd.DataFrame) -> pd.DataFrame:
-    """Create additional engineered features"""
-    input_data = input_data.copy()
-    input_data['temp_difference'] = input_data['Process temperature [K]'] - input_data['Air temperature [K]']
-    input_data['power'] = input_data['Torque [Nm]'] * input_data['Rotational speed [rpm]']
-    input_data['wear_to_torque_ratio'] = input_data['Tool wear [min]'] / (input_data['Torque [Nm]'] + 1e-5)
-    return input_data
-
-def get_recommendation(prediction: int, confidence: float, tool_wear: float) -> str:
-    """Generate maintenance recommendations"""
-    if prediction == 1:
-        if confidence > 0.8:
-            return "Immediate maintenance required! High failure risk detected."
-        else:
-            return "Schedule maintenance soon. Moderate failure risk."
-    else:
-        if tool_wear > 150:
-            return "Monitor closely. High tool wear detected."
-        elif confidence < 0.7:
-            return "Regular monitoring recommended."
-        else:
-            return "Normal operation. Continue routine checks."
-
-def get_alert_level(prediction: int, confidence: float) -> str:
-    """Determine alert level based on prediction and confidence"""
-    if prediction == 1:
-        if confidence > 0.8:
-            return "CRITICAL"
-        elif confidence > 0.6:
-            return "HIGH"
-        else:
-            return "MEDIUM"
-    else:
-        if confidence > 0.8:
-            return "LOW"
-        else:
-            return "MONITOR"
-
-# ==========================
-# 7. API Routes
-# ==========================
-@app.get("/", response_model=APIInfo)
-async def root():
-    """Root endpoint with API information"""
+    for field_name, (min_val, max_val) in VALID_RANGES.items():
+        if field_name in features_dict and features_dict[field_name] is not None:
+            value = features_dict[field_name]
+            
+            # Check if value is within realistic range
+            if not (min_val <= value <= max_val):
+                warning_msg = f"{field_name} ({value}) is outside realistic range ({min_val}-{max_val})"
+                warnings.append(warning_msg)
+                data_quality = "warning"
+                
+                # If value is extremely unrealistic, mark as error
+                abs_min, abs_max = ABSOLUTE_LIMITS[field_name]
+                if not (abs_min <= value <= abs_max):
+                    data_quality = "error"
+    
+    # Special check for process temperature being much higher than air temperature
+    if ('Air temperature [K]' in features_dict and 
+        'Process temperature [K]' in features_dict and
+        features_dict['Process temperature [K]'] > features_dict['Air temperature [K]'] + 50.0):
+        warnings.append("Process temperature is unusually high compared to air temperature")
+        data_quality = "warning"
+    
     return {
-        "name": "Predictive Maintenance API",
+        "warnings": warnings,
+        "data_quality": data_quality,
+        "is_realistic": data_quality == "good"
+    }
+
+def convert_to_preprocessor_format(features_dict: dict) -> dict:
+    """Convert input features to match preprocessor's expected format"""
+    converted = {}
+    
+    if features_dict.get("Type"):
+        converted['Type'] = features_dict["Type"]
+    if features_dict.get("Air temperature [K]") is not None:
+        converted['Air temperature [K]'] = features_dict["Air temperature [K]"]
+    if features_dict.get("Process temperature [K]") is not None:
+        converted['Process temperature [K]'] = features_dict["Process temperature [K]"]
+    if features_dict.get("Rotational speed [rpm]") is not None:
+        converted['Rotational speed [rpm]'] = features_dict["Rotational speed [rpm]"]
+    if features_dict.get("Torque [Nm]") is not None:
+        converted['Torque [Nm]'] = features_dict["Torque [Nm]"]
+    if features_dict.get("Tool wear [min]") is not None:
+        converted['Tool wear [min]'] = features_dict["Tool wear [min]"]
+    
+    return converted
+
+def preprocess_input(features_dict: dict) -> np.ndarray:
+    """Preprocess input features"""
+    try:
+        if preprocessor is None:
+            raise RuntimeError("Preprocessor not loaded")
+
+        # Convert to preprocessor's expected format
+        converted_features = convert_to_preprocessor_format(features_dict)
+        
+        # Check for missing required fields
+        required_fields = ['Type', 'Air temperature [K]', 'Process temperature [K]', 
+                          'Rotational speed [rpm]', 'Torque [Nm]', 'Tool wear [min]']
+        
+        missing_fields = [field for field in required_fields if field not in converted_features]
+        if missing_fields:
+            raise HTTPException(status_code=422, detail=f"Missing required fields: {missing_fields}")
+
+        # Create DataFrame and preprocess
+        input_data = pd.DataFrame([converted_features])
+        logger.info(f"🔧 Input data: {converted_features}")
+        
+        processed_data = preprocessor.transform(input_data)
+
+        # Convert to dense array if sparse
+        if hasattr(processed_data, 'toarray'):
+            processed_data = processed_data.toarray()
+
+        processed_data = processed_data.astype(np.float32)
+        logger.info(f"🔧 Processed data shape: {processed_data.shape}")
+
+        return processed_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error in preprocess_input: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Preprocessing error: {str(e)}")
+
+def predict_with_tflite(processed_data: np.ndarray) -> float:
+    """Make prediction using TensorFlow Lite model"""
+    global interpreter, input_details, output_details
+
+    try:
+        if interpreter is None:
+            raise RuntimeError("Interpreter not loaded")
+
+        interpreter.set_tensor(input_details[0]['index'], processed_data)
+        interpreter.invoke()
+        prediction = interpreter.get_tensor(output_details[0]['index'])
+
+        # Extract scalar value
+        if prediction.ndim == 0:
+            return float(prediction)
+        else:
+            return float(prediction.reshape(-1)[0])
+
+    except Exception as e:
+        logger.error(f"❌ Error in predict_with_tflite: {str(e)}")
+        raise e
+
+# -------------------------------------
+# API Routes
+# -------------------------------------
+@app.get("/")
+async def root():
+    return {
+        "message": "Predictive Maintenance API v2.0",
         "version": "2.0.0",
         "status": "active",
-        "endpoints": [
-            {"path": "/docs", "method": "GET", "description": "Interactive API documentation"},
-            {"path": "/health", "method": "GET", "description": "API health check"},
-            {"path": "/predict", "method": "POST", "description": "Single machine prediction"},
-            {"path": "/predict-batch", "method": "POST", "description": "Batch predictions"},
-            {"path": "/model-info", "method": "GET", "description": "Model information"},
-            {"path": "/example-request", "method": "GET", "description": "Example requests"}
-        ],
-        "documentation": "Visit /docs for interactive API testing"
+        "features": ["data_validation", "quality_check", "realistic_ranges"],
+        "endpoints": {
+            "docs": "/docs",
+            "health": "/health",
+            "predict": "/predict",
+            "model-info": "/model-info",
+            "validate-data": "/validate-data",
+            "test-unrealistic": "/test-unrealistic-data"
+        }
     }
 
-@app.get("/health", response_model=HealthCheck)
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check API health and model status"""
-    return {
-        "status": "healthy" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "timestamp": datetime.now().isoformat(),
-        "version": "2.0.0"
-    }
+    if preprocessor is not None and interpreter is not None:
+        return HealthResponse(
+            status="healthy",
+            models_loaded=True,
+            message="API is ready for predictions"
+        )
+    else:
+        return HealthResponse(
+            status="unhealthy",
+            models_loaded=False,
+            message="Models not loaded properly"
+        )
+
+@app.post("/validate-data", response_model=ValidationResponse)
+async def validate_data(features: MaintenanceFeatures):
+    """Validate data without making prediction"""
+    try:
+        features_dict = features.model_dump(by_alias=True)
+        features_dict = {k: v for k, v in features_dict.items() if v is not None}
+        
+        quality_check = validate_data_quality(features_dict)
+        
+        return ValidationResponse(
+            valid=True,
+            warnings=quality_check["warnings"],
+            data_quality=quality_check["data_quality"]
+        )
+        
+    except ValidationError as e:
+        return ValidationResponse(
+            valid=False,
+            errors=[str(err) for err in e.errors()],
+            data_quality="error"
+        )
+    except Exception as e:
+        return ValidationResponse(
+            valid=False,
+            errors=[str(e)],
+            data_quality="error"
+        )
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_single(machine_data: MachineData):
-    """
-    Predict maintenance need for a single machine
-    
-    - **Type**: Machine type (L, M, H)
-    - **Air_temperature_K**: Air temperature in Kelvin
-    - **Process_temperature_K**: Process temperature in Kelvin  
-    - **Rotational_speed_rpm**: Rotational speed in RPM
-    - **Torque_Nm**: Torque in Newton-meters
-    - **Tool_wear_min**: Tool wear in minutes
-    """
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded. Please try again later.")
-    
+async def predict(features: MaintenanceFeatures):
+    """Main prediction endpoint with data quality checks"""
     try:
-        # Convert to DataFrame with correct column names
-        input_data = pd.DataFrame([{
-            'Type': machine_data.Type,
-            'Air temperature [K]': machine_data.Air_temperature_K,
-            'Process temperature [K]': machine_data.Process_temperature_K,
-            'Rotational speed [rpm]': machine_data.Rotational_speed_rpm,
-            'Torque [Nm]': machine_data.Torque_Nm,
-            'Tool wear [min]': machine_data.Tool_wear_min
-        }])
+        # Convert to dictionary using Pydantic V2 method
+        features_dict = features.model_dump(by_alias=True)
+        features_dict = {k: v for k, v in features_dict.items() if v is not None}
         
-        # Create additional features
-        input_data = create_features(input_data)
+        logger.info(f"🎯 Received prediction request: {features_dict}")
         
-        # Make prediction
-        prediction = model.predict(input_data)[0]
-        probability = model.predict_proba(input_data)[0]
+        # Validate data quality
+        quality_check = validate_data_quality(features_dict)
         
-        # Prepare response
-        if prediction == 1:
-            status = "FAILURE_RISK"
-            prediction_text = "Maintenance Required"
-            maintenance_needed = True
-            confidence = probability[1]
+        # If data quality is error, we might not want to proceed
+        if quality_check["data_quality"] == "error":
+            warning_msg = "Data contains unrealistic values. Prediction may not be reliable."
+        elif quality_check["data_quality"] == "warning":
+            warning_msg = "; ".join(quality_check["warnings"])
         else:
-            status = "NORMAL"
-            prediction_text = "Normal Operation"
-            maintenance_needed = False
-            confidence = probability[0]
+            warning_msg = None
         
-        alert_level = get_alert_level(prediction, confidence)
-        recommendation = get_recommendation(prediction, confidence, machine_data.Tool_wear_min)
+        # Process and predict
+        processed_data = preprocess_input(features_dict)
+        prediction_prob = predict_with_tflite(processed_data)
+        prediction_class = 1 if prediction_prob >= 0.5 else 0
         
-        return PredictionResponse(
-            machine_id=1,
-            status=status,
-            prediction=prediction_text,
-            confidence=round(confidence, 4),
-            alert_level=alert_level,
-            maintenance_needed=maintenance_needed,
-            recommendation=recommendation,
-            timestamp=datetime.now().isoformat()
-        )
+        # Enhanced status based on data quality
+        if quality_check["data_quality"] == "error":
+            status = "Invalid input data - check values"
+        elif quality_check["data_quality"] == "warning":
+            status = f"{'Failure' if prediction_class == 1 else 'No failure'} predicted (data quality warning)"
+        else:
+            status = "Failure predicted" if prediction_class == 1 else "No failure predicted"
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+        logger.info(f"✅ Prediction completed: {prediction_prob:.6f} -> {status}")
 
-@app.post("/predict-batch", response_model=BatchPredictionResponse)
-async def predict_batch(request: PredictionRequest):
-    """
-    Predict maintenance needs for multiple machines at once
-    
-    Provide a list of machine data objects for batch processing
-    """
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded. Please try again later.")
-    
-    try:
-        predictions = []
-        machines_need_maintenance = 0
-        
-        for i, machine_data in enumerate(request.machines, 1):
-            # Convert to DataFrame format
-            input_data = pd.DataFrame([{
-                'Type': machine_data.Type,
-                'Air temperature [K]': machine_data.Air_temperature_K,
-                'Process temperature [K]': machine_data.Process_temperature_K,
-                'Rotational speed [rpm]': machine_data.Rotational_speed_rpm,
-                'Torque [Nm]': machine_data.Torque_Nm,
-                'Tool wear [min]': machine_data.Tool_wear_min
-            }])
-            
-            # Create additional features
-            input_data = create_features(input_data)
-            
-            # Make prediction
-            prediction = model.predict(input_data)[0]
-            probability = model.predict_proba(input_data)[0]
-            
-            # Determine response
-            if prediction == 1:
-                status = "FAILURE_RISK"
-                prediction_text = "Maintenance Required"
-                maintenance_needed = True
-                confidence = probability[1]
-                machines_need_maintenance += 1
-            else:
-                status = "NORMAL"
-                prediction_text = "Normal Operation"
-                maintenance_needed = False
-                confidence = probability[0]
-            
-            alert_level = get_alert_level(prediction, confidence)
-            recommendation = get_recommendation(prediction, confidence, machine_data.Tool_wear_min)
-            
-            predictions.append(
-                PredictionResponse(
-                    machine_id=i,
-                    status=status,
-                    prediction=prediction_text,
-                    confidence=round(confidence, 4),
-                    alert_level=alert_level,
-                    maintenance_needed=maintenance_needed,
-                    recommendation=recommendation,
-                    timestamp=datetime.now().isoformat()
-                )
-            )
-        
-        # Determine overall risk level
-        total_machines = len(request.machines)
-        maintenance_percentage = (machines_need_maintenance / total_machines) * 100
-        
-        if maintenance_percentage > 30:
-            overall_risk = "HIGH"
-        elif maintenance_percentage > 10:
-            overall_risk = "MEDIUM"
-        else:
-            overall_risk = "LOW"
-        
-        return BatchPredictionResponse(
-            predictions=predictions,
-            total_machines=total_machines,
-            machines_need_maintenance=machines_need_maintenance,
-            overall_risk_level=overall_risk,
-            maintenance_percentage=round(maintenance_percentage, 2)
+        return PredictionResponse(
+            prediction=prediction_prob,
+            failure_probability=prediction_prob,
+            prediction_class=prediction_class,
+            status=status,
+            warning=warning_msg,
+            data_quality=quality_check["data_quality"]
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Batch prediction error: {str(e)}")
+        error_msg = f"Prediction error: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/model-info")
-async def get_model_info():
-    """Get detailed information about the loaded ML model"""
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    try:
-        model_type = type(model.named_steps['classifier']).__name__
-        
-        # Get feature information
-        numeric_features = model.named_steps['preprocessor'].transformers_[0][2]
-        categorical_features = model.named_steps['preprocessor'].transformers_[1][1].get_feature_names_out().tolist()
-        all_features = numeric_features + categorical_features
-        
-        feature_importance = None
-        if hasattr(model.named_steps['classifier'], 'feature_importances_'):
-            importances = model.named_steps['classifier'].feature_importances_
-            # Create sorted feature importance list
-            feature_importance = [
-                {"feature": feature, "importance": round(importance, 4)}
-                for feature, importance in zip(all_features, importances)
-            ]
-            feature_importance.sort(key=lambda x: x["importance"], reverse=True)
-        
-        return {
-            "model_type": model_type,
-            "model_loaded": model_loaded,
-            "total_features": len(all_features),
-            "feature_importance": feature_importance[:10] if feature_importance else None,  # Top 10 features
-            "timestamp": datetime.now().isoformat(),
-            "version": "2.0.0"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting model info: {str(e)}")
+async def model_info():
+    if interpreter is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
 
-@app.get("/example-request")
-async def get_example_request():
-    """Get example request structures for testing the API"""
     return {
-        "single_prediction": {
-            "endpoint": "POST /predict",
-            "example_body": {
+        "model_type": "TensorFlow Lite",
+        "input_shape": input_details[0]['shape'].tolist(),
+        "input_type": str(input_details[0]['dtype']),
+        "output_shape": output_details[0]['shape'].tolist(),
+        "output_type": str(output_details[0]['dtype']),
+        "note": "Model expects 8 features after preprocessing"
+    }
+
+@app.get("/test-unrealistic-data")
+async def test_unrealistic_data():
+    """Test endpoint for unrealistic data"""
+    test_cases = [
+        {
+            "name": "Extremely High Temperature",
+            "data": {
                 "Type": "M",
-                "Air_temperature_K": 298.1,
-                "Process_temperature_K": 308.6,
-                "Rotational_speed_rpm": 1551,
-                "Torque_Nm": 42.8,
-                "Tool_wear_min": 0
-            },
-            "description": "Predict maintenance need for a single machine"
+                "Air temperature [K]": 308335464.8,  # Unrealistic
+                "Process temperature [K]": 308.8,
+                "Rotational speed [rpm]": 1450,
+                "Torque [Nm]": 42.3,
+                "Tool wear [min]": 45
+            }
         },
-        "batch_prediction": {
-            "endpoint": "POST /predict-batch", 
-            "example_body": {
-                "machines": [
-                    {
-                        "Type": "L",
-                        "Air_temperature_K": 298.0,
-                        "Process_temperature_K": 308.0,
-                        "Rotational_speed_rpm": 1500,
-                        "Torque_Nm": 40.0,
-                        "Tool_wear_min": 50
-                    },
-                    {
-                        "Type": "H",
-                        "Air_temperature_K": 302.0,
-                        "Process_temperature_K": 315.0, 
-                        "Rotational_speed_rpm": 2500,
-                        "Torque_Nm": 60.0,
-                        "Tool_wear_min": 200
-                    },
-                    {
-                        "Type": "M",
-                        "Air_temperature_K": 299.5,
-                        "Process_temperature_K": 310.0,
-                        "Rotational_speed_rpm": 1800,
-                        "Torque_Nm": 45.0,
-                        "Tool_wear_min": 120
-                    }
-                ]
-            },
-            "description": "Predict maintenance needs for multiple machines"
+        {
+            "name": "Normal Data",
+            "data": {
+                "Type": "M",
+                "Air temperature [K]": 298.5,
+                "Process temperature [K]": 308.8,
+                "Rotational speed [rpm]": 1450,
+                "Torque [Nm]": 42.3,
+                "Tool wear [min]": 45
+            }
+        },
+        {
+            "name": "Extreme Values",
+            "data": {
+                "Type": "M",
+                "Air temperature [K]": 1000.0,  # Very hot
+                "Process temperature [K]": 2000.0,  # Extremely hot
+                "Rotational speed [rpm]": 50000,  # Very high RPM
+                "Torque [Nm]": 1000.0,  # Very high torque
+                "Tool wear [min]": 5000.0  # Very high wear
+            }
         }
-    }
-
-@app.get("/stats")
-async def get_api_stats():
-    """Get API usage statistics and performance metrics"""
-    return {
-        "api_status": "running",
-        "model_status": "loaded" if model_loaded else "not_loaded",
-        "startup_time": "on_startup",
-        "endpoints_available": 6,
-        "supported_operations": ["single_prediction", "batch_prediction", "health_check", "model_info"],
-        "timestamp": datetime.now().isoformat()
-    }
-
-# ==========================
-# 8. Railway & Production Configuration
-# ==========================
-def get_port():
-    """Get port from environment variable for cloud compatibility"""
-    return int(os.environ.get("PORT", 8000))
-
-def start_server():
-    """Start the server with production settings"""
-    port = get_port()
+    ]
     
-    print("🚀" * 50)
-    print("🤖 Predictive Maintenance API Starting...")
-    print(f"📊 Model Loaded: {model_loaded}")
-    print(f"🌐 Port: {port}")
-    print(f"📚 Docs: http://0.0.0.0:{port}/docs")
-    print(f"❤️  Health: http://0.0.0.0:{port}/health")
-    print("🚀" * 50)
+    results = []
+    for test_case in test_cases:
+        try:
+            quality_check = validate_data_quality(test_case["data"])
+            processed_data = preprocess_input(test_case["data"])
+            prediction_prob = predict_with_tflite(processed_data)
+            
+            results.append({
+                "test_case": test_case["name"],
+                "input_data": test_case["data"],
+                "data_quality": quality_check["data_quality"],
+                "warnings": quality_check["warnings"],
+                "prediction_probability": prediction_prob,
+                "prediction_class": 1 if prediction_prob >= 0.5 else 0,
+                "status": "Failure predicted" if prediction_prob >= 0.5 else "No failure predicted"
+            })
+        except Exception as e:
+            results.append({
+                "test_case": test_case["name"],
+                "error": str(e)
+            })
     
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        reload=False,  # Disable in production
-        access_log=True,
-        log_level="info"
-    )
+    return {"test_results": results}
 
+# -------------------------------------
+# Run the Application
+# -------------------------------------
 if __name__ == "__main__":
-    start_server()
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
